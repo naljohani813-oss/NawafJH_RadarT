@@ -1,0 +1,344 @@
+# ============================================
+#  run_pipeline.py  (نسخة منقحة)
+#  - Car + Plate + Digits/Letters detection
+#  - Brand detection (من model ثاني)
+#  - Color estimation بالإنجليزي
+#  - Draw boxes + clean labels on video
+#  - Save output video + show live (scaled)
+# ============================================
+
+import cv2
+import time
+import numpy as np
+from ultralytics import YOLO
+
+# ==============================
+# 1) PATHS (مساراتك)
+# ==============================
+
+PLATE_MODEL_PATH  = r"C:\Users\nawaf\Downloads\NawafJHHack\plate_best.pt"
+BRAND_MODEL_PATH  = r"C:\Users\nawaf\Downloads\NawafJHHack\brand_best.pt"
+VIDEO_PATH        = r"C:\Users\nawaf\Downloads\NawafJHHack\mycarplatee.mp4"
+OUTPUT_VIDEO_PATH = r"C:\Users\nawaf\Downloads\NawafJHHack\cars_output.mp4"
+
+WINDOW_NAME   = "Smart City Radar - Full Pipeline"
+DISPLAY_SCALE = 0.6     # لتصغير العرض في النافذة
+BRAND_CONF_THRES = 0.30 # ثقة البراند
+PLATE_CONF_THRES = 0.45 # ثقة موديل اللوحات/السيارات
+
+# ==============================
+# 2) Load models
+# ==============================
+
+print("[INFO] Loading models ...")
+plate_model = YOLO(PLATE_MODEL_PATH)
+brand_model = YOLO(BRAND_MODEL_PATH)
+
+plate_names = plate_model.names
+brand_names = brand_model.names
+
+print("[INFO] Plate model classes:", plate_names)
+print("[INFO] Brand model classes:", brand_names)
+
+# ==============================
+# 3) Class ID groups (حسب names)
+# ==============================
+
+car_class_ids    = set()
+plate_class_ids  = set()
+arabic_num_ids   = set()
+arabic_text_ids  = set()
+english_num_ids  = set()
+english_text_ids = set()
+
+for cid, name in plate_names.items():
+    nl = name.lower()
+    if "car" in nl or "truck" in nl or "vehicle" in nl:
+        car_class_ids.add(cid)
+    if "plate" in nl or "license" in nl:
+        plate_class_ids.add(cid)
+
+    if "arabic-number" in nl or ("arabic" in nl and "number" in nl):
+        arabic_num_ids.add(cid)
+    if "arabic-text" in nl or ("arabic" in nl and "text" in nl):
+        arabic_text_ids.add(cid)
+    if "english-number" in nl or ("english" in nl and "number" in nl):
+        english_num_ids.add(cid)
+    if "english-text" in nl or ("english" in nl and "text" in nl):
+        english_text_ids.add(cid)
+
+print("[INFO] car_class_ids       :", car_class_ids)
+print("[INFO] plate_class_ids     :", plate_class_ids)
+print("[INFO] arabic_num_ids      :", arabic_num_ids)
+print("[INFO] arabic_text_ids     :", arabic_text_ids)
+print("[INFO] english_num_ids     :", english_num_ids)
+print("[INFO] english_text_ids    :", english_text_ids)
+
+# Colors (BGR)
+COLOR_CAR       = (0, 255, 255)   # Yellow
+COLOR_PLATE     = (0, 255, 0)     # Green
+COLOR_AR_NUM    = (0, 165, 255)   # Orange
+COLOR_AR_TEXT   = (0, 0, 255)     # Red
+COLOR_EN_NUM    = (255, 0, 255)   # Purple
+COLOR_EN_TEXT   = (255, 0, 0)     # Blue
+COLOR_BRAND_BOX = (255, 255, 0)   # Cyan
+
+COLOR_TEXT_BLACK = (0, 0, 0)
+COLOR_TEXT_WHITE = (255, 255, 255)
+
+# ==============================
+# Helpers
+# ==============================
+
+def box_xyxy_to_int(box_tensor):
+    x1, y1, x2, y2 = box_tensor
+    return int(x1), int(y1), int(x2), int(y2)
+
+def box_center(x1, y1, x2, y2):
+    cx = (x1 + x2) / 2
+    cy = (y1 + y2) / 2
+    return cx, cy
+
+def point_in_box(cx, cy, x1, y1, x2, y2):
+    return (cx >= x1) and (cx <= x2) and (cy >= y1) and (cy <= y2)
+
+def estimate_color_name_en(roi_bgr):
+    """
+    لون السيارة بالإنجليزي (بدل العربي عشان ما يطلع ???).
+    """
+    if roi_bgr.size == 0:
+        return "Unknown"
+
+    mean_bgr = roi_bgr.mean(axis=(0, 1))
+    b, g, r = mean_bgr
+    sample = np.uint8([[[b, g, r]]])
+    h, s, v = cv2.cvtColor(sample, cv2.COLOR_BGR2HSV)[0, 0]
+
+    if v < 40:
+        return "Black"
+    if v > 210 and s < 40:
+        return "White"
+    if s < 40:
+        return "Silver/Grey"
+
+    if h < 10 or h >= 170:
+        return "Red"
+    elif h < 30:
+        return "Orange/Brown"
+    elif h < 45:
+        return "Yellow"
+    elif h < 85:
+        return "Green"
+    elif h < 130:
+        return "Blue"
+    elif h < 160:
+        return "Purple"
+    else:
+        return "Unknown"
+
+# ==============================
+# 4) Open video + VideoWriter
+# ==============================
+
+cap = cv2.VideoCapture(VIDEO_PATH)
+if not cap.isOpened():
+    raise RuntimeError(f"Cannot open video/camera: {VIDEO_PATH}")
+
+orig_fps = cap.get(cv2.CAP_PROP_FPS)
+if orig_fps <= 0:
+    orig_fps = 30.0
+
+ret, first_frame = cap.read()
+if not ret:
+    raise RuntimeError("Failed to read first frame.")
+
+h, w, _ = first_frame.shape
+
+fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+video_writer = cv2.VideoWriter(OUTPUT_VIDEO_PATH, fourcc, orig_fps, (w, h))
+
+cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+
+cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
+fps_last_time = time.time()
+print("[INFO] Press 'q' to quit window.")
+
+# ==============================
+# 5) Main loop
+# ==============================
+
+while True:
+    ret, frame = cap.read()
+    if not ret:
+        print("[INFO] Video ended.")
+        break
+
+    frame_out = frame.copy()
+    H, W, _ = frame_out.shape
+
+    # --------- 5.1 Plate/Car model ----------
+    plate_results = plate_model(frame_out, conf=PLATE_CONF_THRES, verbose=False)[0]
+
+    car_boxes = []
+    plate_boxes = []
+
+    if plate_results.boxes is not None:
+        for box in plate_results.boxes:
+            cls_id = int(box.cls[0])
+            conf   = float(box.conf[0])
+            x1, y1, x2, y2 = box_xyxy_to_int(box.xyxy[0])
+
+            x1 = max(0, min(x1, W-1))
+            y1 = max(0, min(y1, H-1))
+            x2 = max(0, min(x2, W-1))
+            y2 = max(0, min(y2, H-1))
+
+            # Car
+            if cls_id in car_class_ids:
+                car_boxes.append({
+                    "x1": x1, "y1": y1, "x2": x2, "y2": y2,
+                    "conf": conf,
+                    "class_id": cls_id,
+                    "brand": None,
+                    "brand_conf": 0.0,
+                    "color": None
+                })
+                cv2.rectangle(frame_out, (x1, y1), (x2, y2), COLOR_CAR, 2)
+
+            # Plate
+            elif cls_id in plate_class_ids:
+                plate_boxes.append({
+                    "x1": x1, "y1": y1, "x2": x2, "y2": y2,
+                    "conf": conf
+                })
+                cv2.rectangle(frame_out, (x1, y1), (x2, y2), COLOR_PLATE, 2)
+                label = f"Plate {conf*100:.1f}%"
+                (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+                cv2.rectangle(frame_out, (x1, y2), (x1 + tw + 4, y2 + th + 6), (0, 0, 0), -1)
+                cv2.putText(frame_out, label, (x1 + 2, y2 + th + 2),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, COLOR_TEXT_WHITE, 1, cv2.LINE_AA)
+
+            # Arabic/English digits & letters
+            elif cls_id in arabic_num_ids:
+                cv2.rectangle(frame_out, (x1, y1), (x2, y2), COLOR_AR_NUM, 2)
+            elif cls_id in arabic_text_ids:
+                cv2.rectangle(frame_out, (x1, y1), (x2, y2), COLOR_AR_TEXT, 2)
+            elif cls_id in english_num_ids:
+                cv2.rectangle(frame_out, (x1, y1), (x2, y2), COLOR_EN_NUM, 2)
+            elif cls_id in english_text_ids:
+                cv2.rectangle(frame_out, (x1, y1), (x2, y2), COLOR_EN_TEXT, 2)
+
+    # --------- 5.2 Brand model ----------
+    brand_results = brand_model(frame_out, conf=BRAND_CONF_THRES, verbose=False)[0]
+
+    brand_detections = []
+    if brand_results.boxes is not None:
+        for box in brand_results.boxes:
+            cls_id = int(box.cls[0])
+            conf   = float(box.conf[0])
+            x1, y1, x2, y2 = box_xyxy_to_int(box.xyxy[0])
+
+            x1 = max(0, min(x1, W-1))
+            y1 = max(0, min(y1, H-1))
+            x2 = max(0, min(x2, W-1))
+            y2 = max(0, min(y2, H-1))
+
+            brand_name = brand_names[cls_id]
+            brand_detections.append({
+                "x1": x1, "y1": y1, "x2": x2, "y2": y2,
+                "conf": conf,
+                "brand": brand_name
+            })
+
+            cv2.rectangle(frame_out, (x1, y1), (x2, y2), COLOR_BRAND_BOX, 2)
+
+    # --------- 5.3 Assign brand to cars ----------
+    for b in brand_detections:
+        bx1, by1, bx2, by2 = b["x1"], b["y1"], b["x2"], b["y2"]
+        brand_name = b["brand"]
+        bconf = b["conf"]
+        cx, cy = box_center(bx1, by1, bx2, by2)
+
+        for car in car_boxes:
+            if point_in_box(cx, cy, car["x1"], car["y1"], car["x2"], car["y2"]):
+                if bconf > car["brand_conf"]:
+                    car["brand"] = brand_name
+                    car["brand_conf"] = bconf
+
+    # --------- 5.4 Estimate car color ----------
+    for car in car_boxes:
+        x1, y1, x2, y2 = car["x1"], car["y1"], car["x2"], car["y2"]
+        roi = frame_out[y1:y2, x1:x2]
+        color_name = estimate_color_name_en(roi)
+        car["color"] = color_name
+
+    # --------- 5.5 Draw labels for each car ----------
+    for car in car_boxes:
+        x1, y1, x2, y2 = car["x1"], car["y1"], car["x2"], car["y2"]
+        conf  = car["conf"]
+        brand = car["brand"]
+        bconf = car["brand_conf"]
+        color = car["color"]
+
+        if brand is not None:
+            line1 = f"{brand} ({bconf*100:.1f}%)"
+        else:
+            line1 = f"Car ({conf*100:.1f}%)"
+
+        if color is not None and color != "Unknown":
+            line2 = f"Color: {color}"
+        else:
+            line2 = None
+
+        # حساب حجم النص
+        (tw1, th1), _ = cv2.getTextSize(line1, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+        total_h = th1 + 8
+        if line2:
+            (tw2, th2), _ = cv2.getTextSize(line2, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+            total_h += th2 + 4
+            tw = max(tw1, tw2)
+        else:
+            tw = tw1
+
+        y_text_top = max(0, y1 - total_h - 4)
+        cv2.rectangle(frame_out, (x1, y_text_top), (x1 + tw + 8, y_text_top + total_h + 4),
+                      (255, 255, 255), -1)
+
+        y_cursor = y_text_top + th1 + 4
+        cv2.putText(frame_out, line1, (x1 + 4, y_cursor),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, COLOR_TEXT_BLACK, 2, cv2.LINE_AA)
+
+        if line2:
+            y_cursor += th2 + 4
+            cv2.putText(frame_out, line2, (x1 + 4, y_cursor),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, COLOR_TEXT_BLACK, 1, cv2.LINE_AA)
+
+    # --------- 5.6 FPS text ----------
+    now = time.time()
+    fps = 1.0 / (now - fps_last_time)
+    fps_last_time = now
+    fps_text = f"FPS: {fps:.1f}"
+    cv2.putText(frame_out, fps_text, (10, 30),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2, cv2.LINE_AA)
+
+    # --------- 5.7 Save + Show ----------
+    video_writer.write(frame_out)
+
+    display_frame = cv2.resize(
+        frame_out,
+        (int(W * DISPLAY_SCALE), int(H * DISPLAY_SCALE)),
+        interpolation=cv2.INTER_AREA
+    )
+    cv2.imshow(WINDOW_NAME, display_frame)
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        print("[INFO] Stopped by user (q).")
+        break
+
+# ==============================
+# 6) Cleanup
+# ==============================
+cap.release()
+video_writer.release()
+cv2.destroyAllWindows()
+print("[INFO] Saved video to:", OUTPUT_VIDEO_PATH)
+print("[INFO] Done.")
